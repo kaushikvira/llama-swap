@@ -510,7 +510,52 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		}
 	}
 
+	// Run afterHealthy hook if configured — fires once after the model is
+	// confirmed healthy, blocking readiness until it completes.
+	if p.config.AfterHealthy != "" {
+		p.proxyLogger.Debugf("<%s> Running afterHealthy hook: %s", p.id, p.config.AfterHealthy)
+		if err := p.runHookCommand(p.config.AfterHealthy, cmd.Env); err != nil {
+			p.proxyLogger.Warnf("<%s> afterHealthy hook failed: %v", p.id, err)
+		}
+	}
+
 	return startResult{cmd: cmd, cmdDone: cmdDone, cancel: cmdCancel, handlerFn: handlerFn}
+}
+
+// hookCommandTimeout bounds how long a lifecycle hook may run before being
+// force-terminated. A 30-second ceiling prevents a hung curl or script from
+// blocking model startup or shutdown indefinitely.
+var hookCommandTimeout = 30 * time.Second
+
+// runHookCommand executes a hook command, logging its output through the
+// process logger. The command inherits the environment of the upstream process
+// and is bounded by hookCommandTimeout to prevent indefinite hangs.
+func (p *ProcessCommand) runHookCommand(hookCmd string, env []string) error {
+	args, err := config.SanitizeCommand(hookCmd)
+	if err != nil {
+		return fmt.Errorf("failed to sanitize hook command %q: %v", hookCmd, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), hookCommandTimeout)
+	defer cancel()
+
+	hookCmdExec := exec.CommandContext(ctx, args[0], args[1:]...)
+	hookCmdExec.Stdout = p.processLogger
+	hookCmdExec.Stderr = p.processLogger
+	if len(env) > 0 {
+		hookCmdExec.Env = env
+	}
+	setProcAttributes(hookCmdExec)
+
+	err = hookCmdExec.Run()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("hook command timed out after %v: %w", hookCommandTimeout, err)
+		}
+		return fmt.Errorf("hook command failed: %w", err)
+	}
+
+	return nil
 }
 
 // sendStopSignal runs the configured CmdStop (if any) or sends SIGTERM to
@@ -580,6 +625,16 @@ func (p *ProcessCommand) killProcess(cmd *exec.Cmd, cancel context.CancelFunc, c
 		return
 	}
 	defer cancel()
+
+	// Run beforeStop hook if configured — fires right before the stop signal,
+	// blocking shutdown until it completes (or fails). The process will be
+	// killed regardless of whether the hook succeeds.
+	if p.config.BeforeStop != "" {
+		p.proxyLogger.Debugf("<%s> Running beforeStop hook: %s", p.id, p.config.BeforeStop)
+		if err := p.runHookCommand(p.config.BeforeStop, cmd.Env); err != nil {
+			p.proxyLogger.Warnf("<%s> beforeStop hook failed: %v", p.id, err)
+		}
+	}
 
 	// Deliver CmdStop / SIGTERM in a goroutine so a slow or hanging CmdStop
 	// cannot block the run() goroutine; the gracefulTimeout + Process.Kill

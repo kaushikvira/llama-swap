@@ -65,6 +65,8 @@ type TimeoutsConfig struct {
 type ModelConfig struct {
 	Cmd           string   `yaml:"cmd"`
 	CmdStop       string   `yaml:"cmdStop"`
+	AfterHealthy  string   `yaml:"afterHealthy"`
+	BeforeStop    string   `yaml:"beforeStop"`
 	Proxy         string   `yaml:"proxy"`
 	Aliases       []string `yaml:"aliases"`
 	Env           []string `yaml:"env"`
@@ -102,6 +104,17 @@ type ModelConfig struct {
 
 	// Copy of HealthCheckTimeout from global config
 	HealthCheckTimeout int `yaml:"healthCheckTimeout"`
+
+	// AfterHealthy runs once after the model passes its health check,
+	// before transitioning to StateReady. Blocks model readiness until done.
+	// Failure is logged as a warning but does not prevent startup.
+	// Useful for loading saved prompt cache slots in llama.cpp.
+	// ${PORT} and ${MODEL_ID} macros are supported.
+
+	// BeforeStop runs right before the upstream process is killed.
+	// Blocks shutdown until completion (or failure), but the process is
+	// killed regardless of outcome. Useful for saving prompt cache slots.
+	// ${PORT} and ${MODEL_ID} macros are supported.
 }
 
 func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
