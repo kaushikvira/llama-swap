@@ -198,6 +198,12 @@ func TestServer_HandleAPIUnloadAll(t *testing.T) {
 	if local.unloadCalls.Load() != 1 {
 		t.Errorf("unloadCalls = %d, want 1", local.unloadCalls.Load())
 	}
+	if len(local.unloadModels) != 0 {
+		t.Errorf("unloadModels = %v, want empty for unload all", local.unloadModels)
+	}
+	if local.unloadTimeout != 0 {
+		t.Errorf("unloadTimeout = %v, want 0 (use configured timeouts)", local.unloadTimeout)
+	}
 }
 
 func TestServer_HandleAPIUnloadModel(t *testing.T) {
@@ -210,6 +216,12 @@ func TestServer_HandleAPIUnloadModel(t *testing.T) {
 		s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/models/unload/m1", nil))
 		if w.Code != http.StatusOK {
 			t.Errorf("status = %d, want 200", w.Code)
+		}
+		if len(local.unloadModels) != 1 || local.unloadModels[0] != "m1" {
+			t.Errorf("unloadModels = %v, want [m1]", local.unloadModels)
+		}
+		if local.unloadTimeout != 0 {
+			t.Errorf("unloadTimeout = %v, want 0 (use configured timeouts)", local.unloadTimeout)
 		}
 	})
 
@@ -224,7 +236,7 @@ func TestServer_HandleAPIUnloadModel(t *testing.T) {
 
 func TestServer_HandleAPICapture(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
-	s.metrics = newMetricsMonitor(logmon.NewWriter(io.Discard), 100, 5)
+	s.metrics = newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 100, 5)
 	s.metrics.addCapture(ReqRespCapture{ID: 42, ReqPath: "/v1/chat/completions"})
 
 	t.Run("found", func(t *testing.T) {

@@ -186,6 +186,12 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			}
 		}
 
+		// Resolve macros in capabilities (they couldn't be decoded properly
+		// during YAML unmarshal because e.g. "${default_ctx}" is not an int).
+		if err := modelConfig.Capabilities.ResolveMacros(mergedMacros); err != nil {
+			return Config{}, fmt.Errorf("model %s: %w", modelId, err)
+		}
+
 		// Handle PORT macro - only allocate if cmd, afterHealthy, or beforeStop uses it
 		cmdHasPort := strings.Contains(modelConfig.Cmd, "${PORT}")
 		afterHealthyHasPort := strings.Contains(modelConfig.AfterHealthy, "${PORT}")

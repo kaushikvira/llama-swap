@@ -17,6 +17,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/mostlygeek/llama-swap/internal/store"
 )
 
 // stubRouter is a minimal router.LocalRouter for Server dispatch tests.
@@ -27,6 +28,8 @@ type stubRouter struct {
 	shutdownCalls atomic.Int32
 	running       map[string]process.ProcessState
 	unloadCalls   atomic.Int32
+	unloadModels  []string
+	unloadTimeout time.Duration
 	loggers       map[string]*logmon.Monitor
 }
 
@@ -50,7 +53,11 @@ func (s *stubRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *stubRouter) RunningModels() map[string]process.ProcessState { return s.running }
-func (s *stubRouter) Unload(_ time.Duration, _ ...string)            { s.unloadCalls.Add(1) }
+func (s *stubRouter) Unload(timeout time.Duration, models ...string) {
+	s.unloadCalls.Add(1)
+	s.unloadTimeout = timeout
+	s.unloadModels = append([]string(nil), models...)
+}
 func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 	if s.loggers != nil {
 		if lg, ok := s.loggers[modelID]; ok {
@@ -64,13 +71,18 @@ func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 func newTestServer(local router.LocalRouter, peer router.Router) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	proxylog := logmon.NewWriter(io.Discard)
+	st, err := store.New("")
+	if err != nil {
+		panic(err)
+	}
 	s := &Server{
 		cfg:         config.Config{},
 		muxlog:      logmon.NewWriter(io.Discard),
 		proxylog:    proxylog,
 		upstreamlog: logmon.NewWriter(io.Discard),
 		inflight:    newInflightTracker(),
-		metrics:     newMetricsMonitor(proxylog, 0, 0),
+		metrics:     newMetricsMonitor(proxylog, 0, 0, st),
+		store:       st,
 		local:       local,
 		peer:        peer,
 		shutdownCtx: ctx,
@@ -78,6 +90,30 @@ func newTestServer(local router.LocalRouter, peer router.Router) *Server {
 	}
 	s.routes()
 	return s
+}
+
+func newTestMetricsMonitor(t *testing.T, logger *logmon.Monitor, maxMetrics int, captureBufferMB int) *metricsMonitor {
+	t.Helper()
+	st, err := store.New("")
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Errorf("store.Close: %v", err)
+		}
+	})
+	return newMetricsMonitor(logger, maxMetrics, captureBufferMB, st)
+}
+
+func metricsEntries(t *testing.T, mm *metricsMonitor) []ActivityLogEntry {
+	t.Helper()
+	page, err := mm.store.ListActivity(context.Background(), store.ActivityQuery{Limit: 1000, Page: 1})
+	if err != nil {
+		t.Fatalf("ListActivity: %v", err)
+	}
+	mm.overlayCaptureState(page.Data)
+	return page.Data
 }
 
 func chatRequest(model string) *http.Request {
@@ -91,7 +127,12 @@ func TestServer_New_GroupConfig(t *testing.T) {
 	discard := logmon.NewWriter(io.Discard)
 	cfg := config.Config{HealthCheckTimeout: 15}
 	cfg.Routing.Router.Use = "group"
-	s, err := New(cfg, discard, discard, discard, nil, BuildInfo{})
+	st, err := store.New("")
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer st.Close()
+	s, err := New(cfg, discard, discard, discard, nil, st, BuildInfo{})
 	if err != nil {
 		t.Fatalf("New (group): %v", err)
 	}
@@ -108,7 +149,12 @@ func TestServer_New_MatrixConfig(t *testing.T) {
 	cfg := config.Config{HealthCheckTimeout: 15}
 	cfg.Routing.Router.Use = "matrix"
 	cfg.Routing.Router.Settings.Matrix = &config.MatrixConfig{}
-	s, err := New(cfg, discard, discard, discard, nil, BuildInfo{})
+	st, err := store.New("")
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	defer st.Close()
+	s, err := New(cfg, discard, discard, discard, nil, st, BuildInfo{})
 	if err != nil {
 		t.Fatalf("New (matrix): %v", err)
 	}
@@ -218,6 +264,12 @@ func TestServer_Unload(t *testing.T) {
 	}
 	if got := local.unloadCalls.Load(); got != 1 {
 		t.Errorf("unloadCalls=%d want 1", got)
+	}
+	if len(local.unloadModels) != 0 {
+		t.Errorf("unloadModels=%v want empty for unload all", local.unloadModels)
+	}
+	if local.unloadTimeout != 0 {
+		t.Errorf("unloadTimeout=%v want 0 (use configured timeouts)", local.unloadTimeout)
 	}
 }
 

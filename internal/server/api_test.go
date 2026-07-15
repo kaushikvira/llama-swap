@@ -82,6 +82,50 @@ func TestServer_HandleListModels_Aliases(t *testing.T) {
 	}
 }
 
+func TestServer_HandleListModels_Status(t *testing.T) {
+	local := newStubRouter(nil, "")
+	local.running = map[string]process.ProcessState{"loaded-model": process.StateReady}
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{
+		IncludeAliasesInList: true,
+		Models: map[string]config.ModelConfig{
+			"loaded-model":   {Aliases: []string{"loaded-alias"}},
+			"unloaded-model": {},
+		},
+		Peers: config.PeerDictionaryConfig{
+			"peer1": {Models: []string{"remote-model"}},
+		},
+	}
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+
+	var resp struct {
+		Data []modelRecord `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	statuses := map[string]string{}
+	for _, m := range resp.Data {
+		statuses[m.ID], _ = m.Status["value"].(string)
+	}
+
+	if statuses["loaded-model"] != "loaded" {
+		t.Errorf("loaded-model status = %q, want loaded", statuses["loaded-model"])
+	}
+	if statuses["loaded-alias"] != "loaded" {
+		t.Errorf("loaded-alias status = %q, want loaded", statuses["loaded-alias"])
+	}
+	if statuses["unloaded-model"] != "unloaded" {
+		t.Errorf("unloaded-model status = %q, want unloaded", statuses["unloaded-model"])
+	}
+	if statuses["remote-model"] != "unloaded" {
+		t.Errorf("remote-model status = %q, want unloaded", statuses["remote-model"])
+	}
+}
+
 func TestServer_FindModelInPath(t *testing.T) {
 	cfg := config.Config{Models: map[string]config.ModelConfig{
 		"author":       {},
@@ -141,7 +185,8 @@ func TestServer_HandleUpstream(t *testing.T) {
 	})
 }
 
-func upstreamMetricsServer(response string) *Server {
+func upstreamMetricsServer(t *testing.T, response string) *Server {
+	t.Helper()
 	cfg := config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
 	proxylog := logmon.NewWriter(io.Discard)
 	s := &Server{
@@ -150,7 +195,7 @@ func upstreamMetricsServer(response string) *Server {
 		proxylog:    proxylog,
 		upstreamlog: logmon.NewWriter(io.Discard),
 		inflight:    newInflightTracker(),
-		metrics:     newMetricsMonitor(proxylog, 10, 0),
+		metrics:     newTestMetricsMonitor(t, proxylog, 10, 0),
 		local:       newStubRouter([]string{"m1"}, response),
 		peer:        newStubRouter(nil, ""),
 	}
@@ -245,7 +290,7 @@ func TestServer_HandleUpstream_IgnorePaths(t *testing.T) {
 
 func TestServer_HandleUpstream_MetricsRecordsSupportedPath(t *testing.T) {
 	resp := `{"usage":{"prompt_tokens":3,"completion_tokens":5}}`
-	s := upstreamMetricsServer(resp)
+	s := upstreamMetricsServer(t, resp)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/upstream/m1/v1/chat/completions", strings.NewReader(`{}`))
@@ -255,7 +300,7 @@ func TestServer_HandleUpstream_MetricsRecordsSupportedPath(t *testing.T) {
 	if w.Code != http.StatusOK || w.Body.String() != resp {
 		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
 	}
-	entries := s.metrics.getMetrics()
+	entries := metricsEntries(t, s.metrics)
 	if len(entries) != 1 {
 		t.Fatalf("want 1 metrics entry, got %d", len(entries))
 	}
@@ -271,7 +316,7 @@ func TestServer_HandleUpstream_MetricsRecordsSupportedPath(t *testing.T) {
 }
 
 func TestServer_HandleUpstream_MetricsSkipsUnsupportedPath(t *testing.T) {
-	s := upstreamMetricsServer("ok")
+	s := upstreamMetricsServer(t, "ok")
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/upstream/m1/probe", strings.NewReader(`{}`))
@@ -281,13 +326,13 @@ func TestServer_HandleUpstream_MetricsSkipsUnsupportedPath(t *testing.T) {
 	if w.Code != http.StatusOK || w.Body.String() != "ok" {
 		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
 	}
-	if len(s.metrics.getMetrics()) != 0 {
-		t.Errorf("want no metrics entries for unsupported path, got %d", len(s.metrics.getMetrics()))
+	if len(metricsEntries(t, s.metrics)) != 0 {
+		t.Errorf("want no metrics entries for unsupported path, got %d", len(metricsEntries(t, s.metrics)))
 	}
 }
 
 func TestServer_HandleUpstream_MetricsSkipsGET(t *testing.T) {
-	s := upstreamMetricsServer(`{"usage":{}}`)
+	s := upstreamMetricsServer(t, `{"usage":{}}`)
 
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/m1/v1/chat/completions", nil))
@@ -295,8 +340,8 @@ func TestServer_HandleUpstream_MetricsSkipsGET(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d", w.Code)
 	}
-	if len(s.metrics.getMetrics()) != 0 {
-		t.Errorf("want no metrics entries for GET upstream, got %d", len(s.metrics.getMetrics()))
+	if len(metricsEntries(t, s.metrics)) != 0 {
+		t.Errorf("want no metrics entries for GET upstream, got %d", len(metricsEntries(t, s.metrics)))
 	}
 }
 
@@ -329,7 +374,7 @@ func TestServer_HandleUpstream_InflightTracksSupportedPaths(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 				w.Write([]byte("ok"))
 			}
-			s = upstreamInflightServer(local)
+			s = upstreamInflightServer(t, local)
 
 			w := httptest.NewRecorder()
 			s.ServeHTTP(w, httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`)))
@@ -359,7 +404,7 @@ func TestServer_HandleUpstream_InflightSkipsUnsupportedPath(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	}
-	s = upstreamInflightServer(local)
+	s = upstreamInflightServer(t, local)
 
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/upstream/m1/probe", strings.NewReader(`{}`)))
@@ -371,7 +416,8 @@ func TestServer_HandleUpstream_InflightSkipsUnsupportedPath(t *testing.T) {
 	}
 }
 
-func upstreamInflightServer(local *stubRouter) *Server {
+func upstreamInflightServer(t *testing.T, local *stubRouter) *Server {
+	t.Helper()
 	cfg := config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
 	proxylog := logmon.NewWriter(io.Discard)
 	s := &Server{
@@ -380,7 +426,7 @@ func upstreamInflightServer(local *stubRouter) *Server {
 		proxylog:    proxylog,
 		upstreamlog: logmon.NewWriter(io.Discard),
 		inflight:    newInflightTracker(),
-		metrics:     newMetricsMonitor(proxylog, 10, 0),
+		metrics:     newTestMetricsMonitor(t, proxylog, 10, 0),
 		local:       local,
 		peer:        newStubRouter(nil, ""),
 	}

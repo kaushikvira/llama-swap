@@ -1,16 +1,13 @@
 <script lang="ts">
-  import { untrack } from "svelte";
   import type { ActivityLogEntry, InflightRequestEntry, ReqRespCapture } from "../lib/types";
-  import { cancelInflightRequest, getCapture } from "../stores/api";
+  import { cancelInflightRequest, getCapture, uiConfig } from "../stores/api";
   import { persistentStore } from "../stores/persistent";
   import CaptureDialog from "./CaptureDialog.svelte";
   import {
     type ColumnDef,
-    type PaginationState,
     type SortingState,
     type VisibilityState,
     getCoreRowModel,
-    getPaginationRowModel,
     getSortedRowModel,
   } from "@tanstack/table-core";
   import {
@@ -40,7 +37,10 @@
   import HeaderLabel from "./activity-table/HeaderLabel.svelte";
   import ViewCaptureButton from "./activity-table/ViewCaptureButton.svelte";
   import MetaCell from "./activity-table/MetaCell.svelte";
+  import ModelLink from "./activity-table/ModelLink.svelte";
+  import MiddleEllipsis from "./activity-table/MiddleEllipsis.svelte";
   import { formatDuration, formatSpeed, formatRelativeTime } from "../lib/format";
+  import { formatBytes, liveElapsedMs, requestHeader, sessionID } from "../lib/inflight";
 
   interface Props {
     metrics: ActivityLogEntry[];
@@ -48,6 +48,15 @@
     storagePrefix: string;
     showModelColumn?: boolean;
     showPagination?: boolean;
+    page?: number;
+    limit?: number;
+    total?: number;
+    totalPages?: number;
+    onPageChange?: (page: number) => void;
+    onPageSizeChange?: (limit: number) => void;
+    sort?: string;
+    order?: "asc" | "desc";
+    onSortChange?: (sort: string, order: "asc" | "desc") => void;
     title?: string;
     compact?: boolean;
     emptyMessage?: string;
@@ -60,6 +69,15 @@
     storagePrefix,
     showModelColumn = true,
     showPagination = false,
+    page = 1,
+    limit = 25,
+    total = metrics.length,
+    totalPages = metrics.length > 0 ? 1 : 0,
+    onPageChange,
+    onPageSizeChange,
+    sort,
+    order = "desc",
+    onSortChange,
     title,
     compact = false,
     emptyMessage = "No activity recorded",
@@ -149,43 +167,101 @@
   });
 
   // svelte-ignore state_referenced_locally
-  const storedPageSize = persistentStore<number>(`${storagePrefix}-page-size`, 10);
-  // svelte-ignore state_referenced_locally
   const storedInflightOpen = persistentStore<boolean>(`${storagePrefix}-inflight-open`, true);
 
-  // When not paginating, use a large page size so all rows render in one page.
-  // svelte-ignore state_referenced_locally
-  let pagination = $state<PaginationState>({
-    pageIndex: 0,
-    pageSize: showPagination ? $storedPageSize : Number.MAX_SAFE_INTEGER,
+  function buildInflightColumnMeta(withModel: boolean): ColMeta[] {
+    const cols: ColMeta[] = [
+      { id: "cancel", label: "Cancel", defaultVisible: true },
+      { id: "elapsed", label: "Elapsed", defaultVisible: true },
+    ];
+    if (withModel) cols.push({ id: "model", label: "Model", defaultVisible: true });
+    cols.push(
+      { id: "request", label: "Request", defaultVisible: true },
+      { id: "identity", label: "Address", defaultVisible: true },
+      { id: "user_agent", label: "User Agent", defaultVisible: true },
+      { id: "session_id", label: "Session ID", defaultVisible: true },
+      { id: "bytes_received", label: "Bytes Received", defaultVisible: true }
+    );
+    return cols;
+  }
+
+  let inflightColumnMeta = $derived(buildInflightColumnMeta(showModelColumn));
+  let inflightColumnLabelMap = $derived(
+    Object.fromEntries(inflightColumnMeta.map((column) => [column.id, column.label])) as Record<string, string>
+  );
+  let inflightDefaultVisibility = $derived.by(() => {
+    const visibility: VisibilityState = {};
+    for (const column of inflightColumnMeta) visibility[column.id] = column.defaultVisible;
+    return visibility;
   });
 
   // svelte-ignore state_referenced_locally
-  let sorting = $state<SortingState>([]);
-  let inflightOpen = $state($storedInflightOpen);
+  const storedInflightVisibility = persistentStore<VisibilityState>(
+    `${storagePrefix}-inflight-columns`,
+    {}
+  );
+  // svelte-ignore state_referenced_locally
+  let inflightColumnVisibility = $state<VisibilityState>(
+    Object.keys($storedInflightVisibility).length > 0
+      ? $storedInflightVisibility
+      : inflightDefaultVisibility
+  );
+  // svelte-ignore state_referenced_locally
+  const storedInflightColumnOrder = persistentStore<string[]>(
+    `${storagePrefix}-inflight-column-order`,
+    []
+  );
+  let inflightDefaultColumnOrder = $derived(inflightColumnMeta.map((column) => column.id));
+  // svelte-ignore state_referenced_locally
+  let inflightColumnOrder = $state<string[]>(
+    $storedInflightColumnOrder.length > 0
+      ? $storedInflightColumnOrder
+      : inflightDefaultColumnOrder
+  );
+  let visibleInflightColumns = $derived(
+    inflightColumnOrder.filter((id) => inflightColumnVisibility[id] !== false)
+  );
 
-  // Reset to the first page when the data source changes. We deliberately do
-  // NOT track pagination here — page-size changes reset pageIndex inside
-  // onPaginationChange instead, to avoid clobbering page navigation.
   $effect(() => {
-    metrics;
-    untrack(() => {
-      pagination = { ...pagination, pageIndex: 0 };
-    });
+    const known = new Set(inflightColumnMeta.map((column) => column.id));
+    const hasStale = inflightColumnOrder.some((id) => !known.has(id));
+    const missing = inflightColumnMeta
+      .filter((column) => !inflightColumnOrder.includes(column.id))
+      .map((column) => column.id);
+    if (hasStale || missing.length > 0) {
+      inflightColumnOrder = [
+        ...inflightColumnOrder.filter((id) => known.has(id)),
+        ...missing,
+      ];
+      storedInflightColumnOrder.set(inflightColumnOrder);
+    }
   });
+
+  // When onSortChange is provided the table sorts on the server: the sort
+  // state is driven by the sort/order props and toggles are forwarded to the
+  // parent. Otherwise it falls back to client-side sorting of the current page.
+  let localSorting = $state<SortingState>([]);
+  let sorting = $derived<SortingState>(
+    onSortChange ? (sort ? [{ id: sort, desc: order === "desc" }] : []) : localSorting
+  );
+  let inflightOpen = $state($storedInflightOpen);
 
   let selectedCapture = $state<ReqRespCapture | null>(null);
   let dialogOpen = $state(false);
   let loadingCaptureId = $state<number | null>(null);
   let cancelingInflightIds = $state<string[]>([]);
-  let inflightNowMs = $state(Date.now());
+  let inflightNowMs = $state(performance.now());
 
   $effect(() => {
     if (inflightRequests.length === 0) return;
 
+    // Refresh synchronously when the first request appears so the initial
+    // render does not use the timestamp from when this component mounted.
+    inflightNowMs = performance.now();
+
     let frame = 0;
     const tick = () => {
-      inflightNowMs = Date.now();
+      inflightNowMs = performance.now();
       frame = requestAnimationFrame(tick);
     };
     frame = requestAnimationFrame(tick);
@@ -242,7 +318,8 @@
         id: "model",
         accessorKey: "model",
         header: "Model",
-        cell: ({ row }) => row.original.model ?? "-",
+        cell: ({ row }) =>
+          renderComponent(ModelLink, { model: row.original.model }),
       });
     }
 
@@ -343,9 +420,6 @@
       return columns;
     },
     state: {
-      get pagination() {
-        return pagination;
-      },
       get columnVisibility() {
         return columnVisibility;
       },
@@ -356,27 +430,21 @@
         return columnOrder;
       },
     },
+    // svelte-ignore state_referenced_locally
+    manualSorting: !!onSortChange,
     onSortingChange: (updater) => {
-      sorting =
-        typeof updater === "function" ? updater(sorting) : updater;
+      const next = typeof updater === "function" ? updater(sorting) : updater;
+      if (onSortChange) {
+        const first = next[0];
+        onSortChange(first?.id ?? "", first?.desc === false ? "asc" : "desc");
+      } else {
+        localSorting = next;
+      }
     },
     onColumnOrderChange: (updater) => {
       columnOrder =
         typeof updater === "function" ? updater(columnOrder) : updater;
       storedColumnOrder.set(columnOrder);
-    },
-    onPaginationChange: (updater) => {
-      const prev = pagination;
-      const next =
-        typeof updater === "function" ? updater(prev) : updater;
-      // Reassign so the table's $effect.pre (which reads state.pagination)
-      // picks up the new value. Reset to first page when the page size
-      // changes so we don't land on an empty page.
-      pagination =
-        next.pageSize !== prev.pageSize
-          ? { pageIndex: 0, pageSize: next.pageSize }
-          : next;
-      if (showPagination) storedPageSize.set(pagination.pageSize);
     },
     onColumnVisibilityChange: (updater) => {
       columnVisibility =
@@ -384,14 +452,34 @@
       storedVisibility.set(columnVisibility);
     },
     getCoreRowModel: getCoreRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
     getSortedRowModel: getSortedRowModel(),
   });
 
-  let thClass = $derived(compact ? "px-4 py-2 h-9" : "px-6 py-3 h-12");
-  let tdClass = $derived(compact ? "px-4 py-2" : "px-6 py-4");
+  let thClass = $derived(compact ? "px-2 py-2 h-9" : "px-3 py-3 h-12");
+  let tdClass = $derived(compact ? "px-2 py-2" : "px-3 py-4");
+  let inflightThClass = $derived(compact ? "h-7 px-2 py-1" : "h-8 px-3 py-1.5");
+  let inflightTdClass = $derived(compact ? "px-2 py-1" : "px-3 py-1.5");
   let visibleColumnCount = $derived(table.getVisibleLeafColumns().length);
-  let pageCount = $derived(Math.max(table.getPageCount(), 1));
+  let pageCount = $derived(Math.max(totalPages, 1));
+  let visiblePages = $derived.by(() => {
+    const maxButtons = 7;
+    const count = pageCount;
+    const current = Math.min(Math.max(page, 1), count);
+    const half = Math.floor(maxButtons / 2);
+    let start = Math.max(1, current - half);
+    let end = Math.min(count, start + maxButtons - 1);
+    start = Math.max(1, end - maxButtons + 1);
+    return Array.from({ length: end - start + 1 }, (_, i) => start + i);
+  });
+
+  function setServerPage(nextPage: number) {
+    const clamped = Math.min(Math.max(nextPage, 1), pageCount);
+    if (clamped !== page) onPageChange?.(clamped);
+  }
+
+  function setServerPageSize(nextLimit: number) {
+    onPageSizeChange?.(nextLimit);
+  }
 
   function sortIcon(state: false | "asc" | "desc") {
     if (state === "asc") return ArrowUp;
@@ -438,81 +526,163 @@
     dragOverColId = null;
   }
 
-  function formatInflightElapsed(timestamp: string): string {
-    const started = Date.parse(timestamp);
-    if (!Number.isFinite(started)) return "0.00s";
-    return `${(Math.max(0, inflightNowMs - started) / 1000).toFixed(2)}s`;
+  function formatInflightElapsed(request: InflightRequestEntry, nowMs: number): string {
+    return `${(liveElapsedMs(request.elapsed_ms, request.client_received_at_ms, nowMs) / 1000).toFixed(2)}s`;
+  }
+
+  function toggleInflightColumn(id: string, visible: boolean) {
+    inflightColumnVisibility = { ...inflightColumnVisibility, [id]: visible };
+    storedInflightVisibility.set(inflightColumnVisibility);
+  }
+
+  let inflightDragColId: string | null = $state(null);
+  let inflightDragOverColId: string | null = $state(null);
+
+  function handleInflightColDragStart(e: DragEvent, id: string) {
+    inflightDragColId = id;
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", id);
+    }
+  }
+
+  function handleInflightColDragOver(e: DragEvent, id: string) {
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    inflightDragOverColId = id;
+  }
+
+  function handleInflightColDrop(e: DragEvent, targetId: string) {
+    e.preventDefault();
+    const sourceId = inflightDragColId;
+    inflightDragColId = null;
+    inflightDragOverColId = null;
+    if (!sourceId || sourceId === targetId) return;
+    const next = [...inflightColumnOrder];
+    const from = next.indexOf(sourceId);
+    let to = next.indexOf(targetId);
+    if (from === -1 || to === -1) return;
+    next.splice(from, 1);
+    if (from < to) to -= 1;
+    next.splice(to, 0, sourceId);
+    inflightColumnOrder = next;
+    storedInflightColumnOrder.set(next);
+  }
+
+  function clearInflightColumnDrag() {
+    inflightDragColId = null;
+    inflightDragOverColId = null;
   }
 </script>
 
 <Card.Root class="relative p-3">
-  <div class="flex items-center gap-2 pr-7 text-sm">
+  <div class="flex items-center gap-2 pr-16 text-sm">
     <span class="text-muted-foreground text-xs uppercase tracking-wider">In-flight Requests</span>
     <span>
       <span class="font-semibold">{inflightRequests.length}</span> active
     </span>
   </div>
 
-  <Button
-    variant="ghost"
-    size="icon-xs"
-    class="text-muted-foreground absolute right-2 top-2 rounded-full"
-    onclick={() => setInflightOpen(!inflightOpen)}
-    title={inflightOpen ? "Hide in-flight requests" : "Show in-flight requests"}
-  >
-    {#if inflightOpen}
-      <X />
-    {:else}
-      <ChevronDown />
-    {/if}
-  </Button>
+  <div class="absolute right-2 top-2 flex items-center gap-1">
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger
+        class="text-muted-foreground hover:bg-muted inline-flex size-6 items-center justify-center rounded-full"
+        title="Select in-flight columns"
+      >
+        <Columns3 class="size-4" />
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Content align="end" class="min-w-[18rem] max-h-[60vh] overflow-y-auto p-0">
+        <DropdownMenu.Label class="text-muted-foreground border-b px-3 py-2 text-xs font-medium uppercase tracking-wider">
+          Columns <span class="text-[10px] normal-case tracking-normal">(drag to reorder)</span>
+        </DropdownMenu.Label>
+        {#each inflightColumnOrder as columnId (columnId)}
+          {@const isDragOver = inflightDragOverColId === columnId && inflightDragColId !== columnId}
+          <DropdownMenu.CheckboxItem
+            checked={inflightColumnVisibility[columnId] !== false}
+            onCheckedChange={(visible) => toggleInflightColumn(columnId, !!visible)}
+            closeOnSelect={false}
+            draggable="true"
+            ondragstart={(event) => handleInflightColDragStart(event, columnId)}
+            ondragover={(event) => handleInflightColDragOver(event, columnId)}
+            ondrop={(event) => handleInflightColDrop(event, columnId)}
+            ondragend={clearInflightColumnDrag}
+            class={isDragOver ? "bg-accent" : ""}
+          >
+            <GripVertical class="text-muted-foreground/50 size-4 cursor-grab active:cursor-grabbing" />
+            <span class="flex-1">{inflightColumnLabelMap[columnId] ?? columnId}</span>
+          </DropdownMenu.CheckboxItem>
+        {/each}
+      </DropdownMenu.Content>
+    </DropdownMenu.Root>
+
+    <Button
+      variant="ghost"
+      size="icon-xs"
+      class="text-muted-foreground rounded-full"
+      onclick={() => setInflightOpen(!inflightOpen)}
+      title={inflightOpen ? "Hide in-flight requests" : "Show in-flight requests"}
+    >
+      {#if inflightOpen}
+        <X />
+      {:else}
+        <ChevronDown />
+      {/if}
+    </Button>
+  </div>
 
   {#if inflightOpen}
-    <div class="mt-3 overflow-x-auto">
+    <div class="mt-2 overflow-x-auto">
       <Table.Root class="min-w-full">
         <Table.Header>
           <Table.Row>
-            <Table.Head class={thClass}>Cancel</Table.Head>
-            <Table.Head class={thClass}>Elapsed</Table.Head>
-            <Table.Head class={thClass}>Model</Table.Head>
-            <Table.Head class={thClass}>Method</Table.Head>
-            <Table.Head class={thClass}>Path</Table.Head>
+            {#each visibleInflightColumns as columnId (columnId)}
+              <Table.Head class={inflightThClass}>{inflightColumnLabelMap[columnId] ?? columnId}</Table.Head>
+            {/each}
           </Table.Row>
         </Table.Header>
         <Table.Body>
           {#each inflightRequests as request (request.id)}
             <Table.Row>
-              <Table.Cell class={tdClass}>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  class="text-muted-foreground hover:text-destructive size-6"
-                  onclick={() => cancelInflight(request.id)}
-                  disabled={cancelingInflightIds.includes(request.id)}
-                  title="Cancel request"
-                  aria-label="Cancel inflight request"
-                >
-                  <CircleX class="size-4" />
-                </Button>
-              </Table.Cell>
-              <Table.Cell class="{tdClass} font-mono text-xs tabular-nums">
-                {formatInflightElapsed(request.timestamp)}
-              </Table.Cell>
-              <Table.Cell class={tdClass}>
-                <span class="block max-w-[16rem] truncate" title={request.model}>
-                  {request.model || "-"}
-                </span>
-              </Table.Cell>
-              <Table.Cell class="{tdClass} font-mono text-xs">{request.method || "-"}</Table.Cell>
-              <Table.Cell class="{tdClass} font-mono text-xs">
-                <span class="block max-w-[22rem] truncate" title={request.req_path}>
-                  {request.req_path || "-"}
-                </span>
-              </Table.Cell>
+              {#each visibleInflightColumns as columnId (columnId)}
+                <Table.Cell class={inflightTdClass}>
+                  {#if columnId === "cancel"}
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      class="text-muted-foreground hover:text-destructive size-6"
+                      onclick={() => cancelInflight(request.id)}
+                      disabled={cancelingInflightIds.includes(request.id)}
+                      title="Cancel request"
+                      aria-label="Cancel inflight request"
+                    >
+                      <CircleX class="size-4" />
+                    </Button>
+                  {:else if columnId === "elapsed"}
+                    <span class="font-mono text-xs tabular-nums">
+                      {formatInflightElapsed(request, inflightNowMs)}
+                    </span>
+                  {:else if columnId === "model"}
+                    <MiddleEllipsis value={request.model} tailLength={10} className="max-w-[14rem]" />
+                  {:else if columnId === "request"}
+                    {@const requestLabel = `${request.method || "-"} ${request.req_path || "-"}`}
+                    <MiddleEllipsis value={requestLabel} tailLength={14} className="max-w-[20rem] font-mono text-xs" />
+                  {:else if columnId === "identity"}
+                    <MiddleEllipsis value={request.remote_ip} tailLength={8} className="max-w-[12rem] font-mono text-xs" />
+                  {:else if columnId === "user_agent"}
+                    {@const userAgent = requestHeader(request.req_headers, "User-Agent")}
+                    <MiddleEllipsis value={userAgent} tailLength={18} className="max-w-[20rem] text-xs" />
+                  {:else if columnId === "session_id"}
+                    {@const session = sessionID(request.req_headers, $uiConfig.activity.session_id)}
+                    <MiddleEllipsis value={session} tailLength={8} className="max-w-[14rem] font-mono text-xs" />
+                  {:else if columnId === "bytes_received"}
+                    <span class="font-mono text-xs tabular-nums">{formatBytes(request.resp_bytes)}</span>
+                  {/if}
+                </Table.Cell>
+              {/each}
             </Table.Row>
           {:else}
             <Table.Row>
-              <Table.Cell colspan={5} class="text-muted-foreground py-6 text-center text-sm">
+              <Table.Cell colspan={Math.max(visibleInflightColumns.length, 1)} class="text-muted-foreground py-4 text-center text-sm">
                 No in-flight requests
               </Table.Cell>
             </Table.Row>
@@ -529,7 +699,7 @@
       {#if title}
         <Card.Title class="text-sm font-semibold">
           {title}
-          <span class="text-muted-foreground text-xs font-normal">({metrics.length})</span>
+          <span class="text-muted-foreground text-xs font-normal">({total})</span>
         </Card.Title>
       {/if}
     </div>
@@ -538,14 +708,14 @@
         <span class="text-muted-foreground text-xs">Rows</span>
         <Select.Root
           type="single"
-          value={String(pagination.pageSize)}
-          onValueChange={(v) => table.setPageSize(Number(v))}
+          value={String(limit)}
+          onValueChange={(v) => setServerPageSize(Number(v))}
         >
           <Select.Trigger size="sm" class="h-7 w-[4.5rem] text-xs">
-            {pagination.pageSize}
+            {limit}
           </Select.Trigger>
           <Select.Content>
-            {#each [5, 10, 25, 50] as size (size)}
+            {#each [10, 25, 50, 100] as size (size)}
               <Select.Item value={String(size)}>{size}</Select.Item>
             {/each}
           </Select.Content>
@@ -633,17 +803,17 @@
       </Table.Body>
     </Table.Root>
 
-    {#if showPagination && metrics.length > 0}
+    {#if showPagination && total > 0}
       <div class="flex items-center justify-between gap-2 border-t px-4 py-2 text-sm">
         <span class="text-muted-foreground text-xs">
-          Page {pagination.pageIndex + 1} of {pageCount} · {metrics.length} total
+          Page {page} of {pageCount} · {total} total
         </span>
         <div class="flex items-center gap-1">
           <Button
             variant="ghost"
             size="icon-sm"
-            onclick={() => table.setPageIndex(0)}
-            disabled={!table.getCanPreviousPage()}
+            onclick={() => setServerPage(1)}
+            disabled={page <= 1}
             title="First page"
           >
             <ChevronsLeft />
@@ -651,17 +821,28 @@
           <Button
             variant="ghost"
             size="icon-sm"
-            onclick={() => table.previousPage()}
-            disabled={!table.getCanPreviousPage()}
+            onclick={() => setServerPage(page - 1)}
+            disabled={page <= 1}
             title="Previous page"
           >
             <ChevronLeft />
           </Button>
+          {#each visiblePages as pageNumber (pageNumber)}
+            <Button
+              variant={pageNumber === page ? "secondary" : "ghost"}
+              size="sm"
+              class="h-7 min-w-7 px-2 text-xs"
+              onclick={() => setServerPage(pageNumber)}
+              disabled={pageNumber === page}
+            >
+              {pageNumber}
+            </Button>
+          {/each}
           <Button
             variant="ghost"
             size="icon-sm"
-            onclick={() => table.nextPage()}
-            disabled={!table.getCanNextPage()}
+            onclick={() => setServerPage(page + 1)}
+            disabled={page >= pageCount}
             title="Next page"
           >
             <ChevronRight />
@@ -669,8 +850,8 @@
           <Button
             variant="ghost"
             size="icon-sm"
-            onclick={() => table.setPageIndex(pageCount - 1)}
-            disabled={!table.getCanNextPage()}
+            onclick={() => setServerPage(pageCount)}
+            disabled={page >= pageCount}
             title="Last page"
           >
             <ChevronsRight />

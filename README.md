@@ -216,6 +216,7 @@ Almost all configuration settings are optional and can be added one step at a ti
   - `macros` reusable snippets
 - Model customization
   - `ttl` to automatically unload models
+  - `unloadTimeout` to tune graceful unloads (manual, API and `ttl` expiry)
   - `aliases` to use familiar model names (e.g., "gpt-4o-mini")
   - `env` to pass custom environment variables to inference servers
   - `cmdStop` gracefully stop Docker/Podman containers
@@ -285,10 +286,3 @@ curl -Ns 'http://host/logs/stream?no-history'
 Any OpenAI compatible server would work. llama-swap was originally designed for llama-server and it is the best supported.
 
 For Python based inference servers like vllm or tabbyAPI it is recommended to run them via podman or docker. This provides clean environment isolation as well as responding correctly to `SIGTERM` signals for proper shutdown.
-
-## Star History
-
-> [!NOTE]
-> Thank you to everyone who has given this project a ⭐️!
-
-[![Star History Chart](https://api.star-history.com/svg?repos=mostlygeek/llama-swap&type=Date)](https://www.star-history.com/#mostlygeek/llama-swap&Date)
